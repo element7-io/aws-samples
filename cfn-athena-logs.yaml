@@ -1,0 +1,769 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Athena setup for querying ALB and VPC flow logs
+  This template is based on the follwing AWS Documentation:
+  https://aws.amazon.com/premiumsupport/knowledge-center/athena-analyze-access-logs/
+  https://aws.amazon.com/about-aws/whats-new/2021/04/amazon-vpc-flow-logs-announces-out-of-box-integration-with-amazon-athena/
+
+Parameters:
+  EnvironmentName:
+    Type: String
+  Context:
+    Type: String
+  FlowLogsLocation:
+    Type: String
+  AlbLogsLocation:
+    Type: String
+  InitialPartitionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+  AthenaDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      DatabaseInput:
+        Name: !Sub ${Context}_${EnvironmentName}
+      CatalogId: !Ref AWS::AccountId
+
+  QueryResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName:  !Join [ "-",  !Split [ "_",   !Sub "aws-athena-query-results-${EnvironmentName}-${AWS::AccountId}-${AWS::Region}-cfn" ]]
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  QueryResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref QueryResultsBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Action: s3:*
+            Principal: "*"
+            Resource:
+              - !Sub ${QueryResultsBucket.Arn}/*
+              - !GetAtt QueryResultsBucket.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${QueryResultsBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${QueryResultsBucket}/*
+            Principal:
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+
+  LogsWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    DependsOn:
+      - QueryResultsBucket
+    Properties:
+      Name: !Sub ${Context}_wrkgrp_${EnvironmentName}
+      Description: !Sub This workgroup has the queries related to ${Context} ${EnvironmentName}
+      State: ENABLED
+      Tags:
+        - Key: "service"
+          Value: "vpc_flow_logs"
+      WorkGroupConfiguration:
+        # BytesScannedCutoffPerQuery: 512000000 #512MB
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Join [ "-",  !Split [ "_",   !Sub "s3://aws-athena-query-results-${EnvironmentName}-${AWS::AccountId}-${AWS::Region}-cfn" ]]
+        EngineVersion:
+          SelectedEngineVersion: 'Athena engine version 2'
+
+  VpcFlowLogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AthenaDatabase
+      TableInput:
+        Description: This table has the schema for vpc flow logs information.
+        Name: !Sub vpcflowlogs_${EnvironmentName}
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+          Location:  !Ref FlowLogsLocation
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              skip.header.line.count: "1"
+              EXTERNAL: "true"
+              field.delim: ' '
+              serialization.format: ' '
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+          Columns:
+            - Name: version
+              Type: int
+            - Name: account_id
+              Type: string
+            - Name: interface_id
+              Type: string
+            - Name: srcaddr
+              Type: string
+            - Name: dstaddr
+              Type: string
+            - Name: srcport
+              Type: int
+            - Name: dstport
+              Type: int
+            - Name: traffic_protocol
+              Type: bigint
+            - Name: packets
+              Type: bigint
+            - Name: bytes
+              Type: bigint
+            - Name: start_time
+              Type: bigint
+            - Name: end_time
+              Type: bigint
+            - Name: traffic_action
+              Type: string
+            - Name: log_status
+              Type: string
+
+  # creates an IAM role for lambda function execution permission.
+  AthenaIntegrationLambdaExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: VPCFlowLogsAthenaIntegrationLambdaExecutorPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'glue:GetTable'
+                  - 'glue:CreatePartition'
+                  - 'glue:UpdatePartition'
+                  - 'glue:GetPartition'
+                Resource: "*"
+
+  FlowLogsInitializer:
+    Type: Custom::VPCFlowLogsAthenaStartInitializer
+    DependsOn:
+      - VpcFlowLogsTable
+    Properties:
+      ServiceToken: !GetAtt InitializerLogsAsync.Arn
+      dbName: !Ref AthenaDatabase
+      athenaIntegrations:
+        - partitionTableName: !Sub vpcflowlogs_${EnvironmentName}
+          initialPartitionDays: !Ref InitialPartitionDays
+
+  ScheduledEventRuleFlowsLogDailyPartitioning:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: This event rule will be invoking lambda based on schedule
+      Name: !Sub ScheduledEventRuleFlowLogDailyPartitioning-${EnvironmentName}
+      ScheduleExpression: cron(0 0 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LogsPartitioner.Arn
+          Id: !Sub PartitionerEventRuleDailyFlow${EnvironmentName}Id
+          Input: !Sub "{\"db\": \"${Context}_${EnvironmentName}\", \"athena\": [ {\"partitionTableName\": \"vpcflowlogs_${EnvironmentName}\"}]}"
+
+  ScheduledFlowLogsEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LogsPartitioner.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledEventRuleFlowsLogDailyPartitioning.Arn
+
+##### ALB Logs #####################################################################################
+
+  AlbLogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AthenaDatabase
+      TableInput:
+        Description: !Sub This table has the schema for the ${Context} alb logs information.
+        Name: !Sub ${Context}_alblogs_${EnvironmentName}
+        PartitionKeys:
+          - Name: year
+            Type: int
+          - Name: month
+            Type: int
+          - Name: day
+            Type: int
+        TableType: EXTERNAL_TABLE
+        StorageDescriptor:
+          Location:  !Ref AlbLogsLocation
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              serialization.format: '1'
+              input.regex: '([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*):([0-9]*) ([^ ]*)[:-]([0-9]*) ([-.0-9]*) ([-.0-9]*) ([-.0-9]*) (|[-0-9]*) (-|[-0-9]*) ([-0-9]*) ([-0-9]*) "([^ ]*) ([^ ]*) (- |[^ ]*)" "([^"]*)" ([A-Z0-9-]+) ([A-Za-z0-9.-]*) ([^ ]*) "([^"]*)" "([^"]*)" "([^"]*)" ([-.0-9]*) ([^ ]*) "([^"]*)" "([^"]*)" "([^ ]*)" "([^s]+?)" "([^s]+)" "([^ ]*)" "([^ ]*)"'
+            SerializationLibrary: org.apache.hadoop.hive.serde2.RegexSerDe
+          Columns:
+            - Name: type
+              Type: string
+            - Name: time
+              Type: string
+            - Name: elb
+              Type: string
+            - Name: client_ip
+              Type: string
+            - Name: client_port
+              Type: int
+            - Name: target_ip
+              Type: string
+            - Name: target_port
+              Type: int
+            - Name: request_processing_time
+              Type: double
+            - Name: target_processing_time
+              Type: double
+            - Name: response_processing_time
+              Type: double
+            - Name: elb_status_code
+              Type: string
+            - Name: target_status_code
+              Type: string
+            - Name: received_bytes
+              Type: bigint
+            - Name: sent_bytes
+              Type: bigint
+            - Name: request_verb
+              Type: string
+            - Name: request_url
+              Type: string
+            - Name: request_proto
+              Type: string
+            - Name: user_agent
+              Type: string
+            - Name: ssl_cipher
+              Type: string
+            - Name: ssl_protocol
+              Type: string
+            - Name: target_group_arn
+              Type: string
+            - Name: trace_id
+              Type: string
+            - Name: domain_name
+              Type: string
+            - Name: chosen_cert_arn
+              Type: string
+            - Name: matched_rule_priority
+              Type: string
+            - Name: request_creation_time
+              Type: string
+            - Name: actions_executed
+              Type: string
+            - Name: redirect_url
+              Type: string
+            - Name: lambda_error_reason
+              Type: string
+            - Name: target_port_list
+              Type: string
+            - Name: target_status_code_list
+              Type: string
+            - Name: classification
+              Type: string
+            - Name: classification_reason
+              Type: string
+
+  AlbLogInitializer:
+    Type: Custom::AlbLogsAthenaStartInitializer
+    DependsOn:
+      - AlbLogsTable
+    Properties:
+      ServiceToken: !GetAtt InitializerLogsAsync.Arn
+      dbName: !Ref AthenaDatabase
+      athenaIntegrations:
+        - partitionTableName: !Sub ${Context}_alblogs_${EnvironmentName}
+          initialPartitionDays: !Ref InitialPartitionDays
+
+  ScheduledEventRuleAlbLogDailyPartitioning:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: This event rule will be invoking lambda based on schedule
+      Name: !Sub ScheduledEventRuleAlbLogDailyPartitioning-${EnvironmentName}
+      ScheduleExpression: cron(0 0 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LogsPartitioner.Arn
+          Id: !Sub PartitionerEventRuleDailyAlb${EnvironmentName}Id
+          Input: !Sub "{\"db\": \"${Context}_${EnvironmentName}\", \"athena\": [ {\"partitionTableName\": \"${Context}_alblogs_${EnvironmentName}\"}]}"
+
+  ScheduledAlbLogsEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LogsPartitioner.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledEventRuleAlbLogDailyPartitioning.Arn
+
+##### Helper functions #############################################################################
+
+  InitializerLogsAsync:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const response = require('./cfn-response');
+          const AWS = require('aws-sdk');
+          const glue = new AWS.Glue();
+
+          exports.handler =  async function(event, context) {
+            let errs = [], status
+            if (event.RequestType === 'Delete') {
+              status = response.SUCCESS
+            } else {
+                console.log("Parsing athena configs")
+                let rp = event.ResourceProperties
+                let confs = rp.athenaIntegrations;
+                let db = rp.dbName
+
+                let errs = []
+
+                for(let i = 0; i < confs.length; i++) {
+                  let cnf = confs[i]
+                  let tab = cnf['partitionTableName']
+                  let initDays = cnf['initialPartitionDays']
+                  let strt = new Date();
+                  strt.setDate(strt.getDate()-initDays); 
+                  let end = new Date()
+
+                  while(strt <= end) {
+                    let table = await glue.getTable({
+                      DatabaseName: db,
+                      Name: tab,
+                    }).promise()
+
+                    let strgDesc = table.Table['StorageDescriptor']
+                    let Values
+                    let newDate = new Date()
+                    Values = [String(strt.getFullYear()), ("0" + (strt.getMonth() + 1)).slice(-2), ("0" + strt.getDate()).slice(-2)]
+                    newDate = strt.setDate(strt.getDate() + 1);
+
+                    try {
+                      let result = await glue.getPartition({
+                          DatabaseName: db,
+                          TableName: tab,
+                          PartitionValues: Values
+                      }).promise()
+                    } catch (err) {
+                      if(err.code === 'EntityNotFoundException'){
+                          console.log(strgDesc)
+                          let params = {
+                              DatabaseName: db,
+                              TableName: tab,
+                              PartitionInput: {
+                                  StorageDescriptor: {
+                                      ...strgDesc,
+                                      Location: `${strgDesc.Location}${Values.join('/')}/`
+                                  },
+                                  Values,
+                              },
+                          }
+                          await glue.createPartition(params).promise()
+                      } else {
+                          errs.push(err)
+                      }
+                    }
+                    strt = new Date(newDate);
+                  }
+                }
+
+                status = errs.length > 0 ? response.FAILED : response.SUCCESS
+              }
+              return new Promise(() => response.send(event, context, status,
+              errs.length > 0 ? { error: errs } : {}, event.LogicalResourceId));
+          }
+      Handler: 'index.handler'
+      Timeout: 600
+      Runtime: nodejs14.x
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt AthenaIntegrationLambdaExecutorRole.Arn
+
+  LogsPartitioner:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - VpcFlowLogsTable
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const glue = new AWS.Glue();
+
+          exports.handler = async function(event, context) {
+            let db = event.db
+            let confs = event.athena
+            let today = new Date()
+            let errs = []
+
+            for(let i = 0; i < confs.length; i++) {
+              let cnf = confs[i]
+              let tab = cnf['partitionTableName']
+
+              let table = await glue.getTable({
+                DatabaseName: db,
+                Name: tab,
+              }).promise()
+
+              let strgDesc = table.Table['StorageDescriptor']
+              let Values
+
+              Values = [String(today.getFullYear()), ("0" + (today.getMonth() + 1)).slice(-2), ("0" + (today.getDate())).slice(-2)]
+
+              try {
+                let result = await glue.getPartition({
+                  DatabaseName: db,
+                  TableName: tab,
+                  PartitionValues: Values
+                }).promise()
+              } catch (err) {
+                  if(err.code === 'EntityNotFoundException'){
+                    console.log(strgDesc)
+                    let params = {
+                      DatabaseName: db,
+                      TableName: tab,
+                      PartitionInput: {
+                        StorageDescriptor: {
+                            ...strgDesc,
+                            Location: `${strgDesc.Location}${Values.join('/')}/`
+                        },
+                        Values,
+                      },
+                    }
+                    await glue.createPartition(params).promise()
+                  } else {
+                    errs.push(err)
+                }
+              }
+            }
+
+            return new Promise(function(resolve, reject) { errs.length > 0 ? reject(errs) : resolve("SUCCESS")});
+          }
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs14.x
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt AthenaIntegrationLambdaExecutorRole.Arn
+
+##### Flow Log Queries #############################################################################
+
+  VpcFlowLogsTotalBytes:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Top 50 pairs of source and destination IP addresses with the most bytes transferred. The start_time and end_time in the WHERE clause are placeholders"
+      Name: VpcFlowLogsTotalBytesTransferred
+      QueryString: !Sub >
+        SELECT SUM(bytes) as totalbytes, srcaddr, dstaddr from vpcflowlogs_${EnvironmentName}
+        WHERE day = cast(day_of_month(current_date) AS VARCHAR)
+        AND month = cast(month(current_date) AS VARCHAR)
+        AND year  = cast(year(current_date) AS VARCHAR)
+        GROUP BY srcaddr, dstaddr
+        ORDER BY totalbytes
+        LIMIT 50
+      WorkGroup: !Ref LogsWorkGroup
+
+  VpcFlowLogsTopTalkers:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "The top 50 IPs transmitting traffic in your VPC/ENI/Subnet."
+      Name: VpcFlowLogsTopTalkers
+      QueryString: !Sub >
+        SELECT srcaddr, sum(bytes) as bytes
+        FROM vpcflowlogs_${EnvironmentName}
+        WHERE day = cast(day_of_month(current_date) AS VARCHAR)
+        AND month = cast(month(current_date) AS VARCHAR)
+        AND year  = cast(year(current_date) AS VARCHAR)
+        GROUP BY srcaddr
+        ORDER BY bytes DESC
+        LIMIT 50
+      WorkGroup: !Ref LogsWorkGroup
+
+
+  VpcFlowLogsSshRdpTraffic:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Monitor SSH and RDP traffic"
+      Name: VpcFlowLogsSshRdpTraffic
+      QueryString: !Sub >
+        SELECT *
+        FROM vpcflowlogs_${EnvironmentName}
+        WHERE day = cast(day_of_month(current_date) AS VARCHAR)
+        AND month = cast(month(current_date) AS VARCHAR)
+        AND year  = cast(year(current_date) AS VARCHAR)
+        AND (srcport in (22,3389) OR dstport IN (22, 3389))
+        ORDER BY start_time ASC
+        limit 50
+      WorkGroup: !Ref LogsWorkGroup
+
+  VpcFlowLogsAdminPortTraffic:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Monitor the traffic on administrative web app ports"
+      Name: VpcFlowLogsAdminPortTrafficf
+      QueryString: !Sub >
+        SELECT ip, sum(bytes) as total_bytes
+        FROM (
+        SELECT dstaddr as ip,sum(bytes) as bytes
+        FROM vpcflowlogs_${EnvironmentName}
+        GROUP BY 1
+        UNION ALL
+        SELECT srcaddr as ip,sum(bytes) as bytes
+        FROM vpcflowlogs_${EnvironmentName}
+        GROUP BY 1
+        )
+        GROUP BY ip
+        ORDER BY total_bytes
+        DESC LIMIT 10
+      WorkGroup: !Ref LogsWorkGroup
+
+  VpcFlowLogsRejectedTraffic:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Recorded traffic which was not permitted by the security groups or network ACLs."
+      Name: VpcFlowLogsRejectedTraffic
+      QueryString: !Sub >
+        SELECT srcaddr, dstaddr, dstport, count(*) count, traffic_action
+        FROM vpcflowlogs_${EnvironmentName}
+        WHERE day = cast(day_of_month(current_date) AS VARCHAR)
+        AND month = cast(month(current_date) AS VARCHAR)
+        AND year  = cast(year(current_date) AS VARCHAR)
+        AND traffic_action = 'REJECT'
+        GROUP BY srcaddr, dstaddr, dstport, traffic_action
+        ORDER BY count desc
+        LIMIT 25
+      WorkGroup: !Ref LogsWorkGroup
+
+  VpcFlowLogsTrafficFrmSrcAddr:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Traffic transmitted from a particular source IP address. Here the source address (srcaddr) is a placeholder"
+      Name: VpcFlowLogsTrafficFrmSrcAddr
+      QueryString: !Sub >
+        SELECT *
+        FROM vpcflowlogs_${EnvironmentName}
+        WHERE srcaddr = '198.51.100.2'
+        ORDER BY start_time ASC
+        LIMIT 50;
+      WorkGroup: !Ref LogsWorkGroup
+
+  VpcFlowLogsTrafficToDstAddr:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Traffic transmitted from a particular destination IP address. Here the destination address (dstaddr) is a placeholder"
+      Name: VpcFlowLogsTrafficToDstAddr
+      QueryString: !Sub >
+        SELECT *
+        FROM vpcflowlogs_${EnvironmentName}
+        WHERE dstaddr = '198.51.100.2'
+        ORDER BY start_time ASC
+        LIMIT 50;
+      WorkGroup: !Ref LogsWorkGroup
+
+##### Alb Logs Queries #############################################################################
+
+  AlbLogsFirstAccessLogs:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "View the first 100 access log entries in chronological order"
+      Name: AlbLogsFirstAccessLogs
+      QueryString: !Sub >
+        SELECT *
+        FROM ${Context}_alblogs_${EnvironmentName}
+        WHERE day = day_of_month(current_date)
+        AND month = month(current_date)
+        AND year  = year(current_date)
+        ORDER by time ASC
+        LIMIT 100
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListIps:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List all client IP addresses that accessed the Application Load Balancer, and how many times they accessed the Application Load Balancer"
+      Name: AlbLogsListClientIps
+      QueryString: !Sub >
+        SELECT distinct client_ip, count() as count
+        FROM ${Context}_alblogs_${EnvironmentName}
+        GROUP by client_ip
+        ORDER by count() DESC
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsAverageAmount:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List the average amount of data (in kilobytes) that is passing through the Application Load Balancer in request/response pairs"
+      Name: AlbLogsAverageDataAmount
+      QueryString: !Sub >
+        SELECT (avg(sent_bytes)/1000.0 + avg(received_bytes)/1000.0) as prewarm_kilobytes
+        FROM ${Context}_alblogs_${EnvironmentName}
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListTargetGroups:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List all targets that the Application Load Balancer is routing traffic to and how many times the Application Load Balancer has routed requests to each target, by percentage distribution"
+      Name: AlbLogsListTargetGroups
+      QueryString: !Sub >
+        SELECT target_ip, (
+          Count(target_ip)* 100.0 / (
+            SELECT Count(*)
+            FROM ${Context}_alblogs_${EnvironmentName}
+          )
+        ) AS backend_traffic_percentage
+        FROM ${Context}_alblogs_${EnvironmentName}
+        GROUP by target_ip
+        ORDER By count() DESC
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListIdleTimeout:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List the times that a client sent a request to the Application Load Balancer and then terminated the connection to the Application Load Balancer before the idle timeout elapsed (HTTP 460 error)"
+      Name: AlbLogsListIdleTimeout
+      QueryString: !Sub >
+        SELECT *
+        FROM ${Context}_alblogs_${EnvironmentName}
+        WHERE day = day_of_month(current_date)
+        AND month = month(current_date)
+        AND year  = year(current_date)
+        AND elb_status_code = '460';
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListNotRouted:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List the times that a client request wasn't routed because the listener rule forwarded the request to an empty target group (HTTP 503 error)"
+      Name: AlbLogsListNotRouted
+      QueryString: !Sub >
+        SELECT *
+        FROM ${Context}_alblogs_${EnvironmentName}
+        WHERE day = day_of_month(current_date)
+        AND month = month(current_date)
+        AND year  = year(current_date)
+        AND elb_status_code = '503';
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListClientVisitedUrl:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List clients in descending order, by the number of times that each client visited a specified URL"
+      Name: AlbLogsListClientVisitedUrl
+      QueryString: !Sub >
+        SELECT client_ip, elb, request_url, count(*) as count
+        FROM ${Context}_alblogs_${EnvironmentName}
+        GROUP by client_ip, elb, request_url
+        ORDER by count DESC
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListBrowserAccess:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List the 10 URLs that Firefox users accessed most frequently, in descending order"
+      Name: AlbLogsListBrowserAccess
+      QueryString: !Sub >
+        SELECT request_url, user_agent, count(*) as count
+        FROM ${Context}_alblogs_${EnvironmentName}
+        WHERE user_agent LIKE '%Firefox%'
+        GROUP by request_url, user_agent
+        ORDER by count(*) DESC
+        LIMIT 10
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListClientDataSent:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List clients in descending order, by the amount of data (in megabytes) that each client sent in their requests to the Application Load Balancer"
+      Name: AlbLogsListClientDataSent
+      QueryString: !Sub >
+        SELECT client_ip, sum(received_bytes/1000000.0) as client_datareceived_megabytes
+        FROM ${Context}_alblogs_${EnvironmentName}
+        GROUP by client_ip
+        ORDER by client_datareceived_megabytes DESC
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListSlowProcessing:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "List each time in a specified date range when the target processing time was more than 5 seconds"
+      Name: AlbLogsListSlowProcessing
+      QueryString: !Sub >
+        SELECT *
+        FROM ${Context}_alblogs_${EnvironmentName}
+        WHERE day = day_of_month(current_date)
+        AND month = month(current_date)
+        AND year  = year(current_date)
+        AND (target_processing_time >= 5.0)
+      WorkGroup: !Ref LogsWorkGroup
+
+  AlbLogsListNumberOfRequests:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref AthenaDatabase
+      Description: "Count the number of HTTP GET requests received by the load balancer grouped by the client IP address"
+      Name: AlbLogsListNumberOfRequests
+      QueryString: !Sub >
+        SELECT COUNT(request_verb) AS count, request_verb, client_ip
+        FROM ${Context}_alblogs_${EnvironmentName}
+        WHERE day = day_of_month(current_date)
+        AND month = month(current_date)
+        AND year  = year(current_date)
+        GROUP BY request_verb, client_ip
+      WorkGroup: !Ref LogsWorkGroup
