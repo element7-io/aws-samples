@@ -7,9 +7,10 @@ phases:
   build:
     commands:
       - echo Entered the build phase...
+      - codebuild-breakpoint
       - echo Build started on `date`
       - pwd
-      - ls l
+      - ls -l
   post_build:
     commands:
       - echo Entered the post_build phase...
