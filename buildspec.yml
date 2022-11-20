@@ -1,0 +1,16 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - echo Entered the install phase...
+      - apt-get update -y
+  build:
+    commands:
+      - echo Entered the build phase...
+      - echo Build started on `date`
+      - pwd
+      - ls l
+  post_build:
+    commands:
+      - echo Entered the post_build phase...
+      - echo Build completed on `date`
